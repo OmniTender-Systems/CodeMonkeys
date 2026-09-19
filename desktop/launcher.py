@@ -7,12 +7,20 @@ WebView2 window (pywebview). Data lives under %APPDATA%\\codemonkeys.
 
 from __future__ import annotations
 
-import atexit
 import os
+import sys
+
+# PyInstaller console=False builds run with sys.stdout/stderr as None;
+# uvicorn's logging calls sys.stdout.isatty() and crashes on startup.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+import atexit
 import shutil
 import socket
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
