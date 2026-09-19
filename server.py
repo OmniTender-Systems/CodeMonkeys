@@ -915,6 +915,12 @@ def _read_enc_file(path: str, default):
     return data, needs_migrate
 
 
+def _fchmod(fd: int, mode: int) -> None:
+    """Best-effort file mode; Windows Python has no os.fchmod."""
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, mode)  # type: ignore[attr-defined]
+
+
 def _write_enc_file(path: str, data, mode: int = 0o600,
                     clear_decrypt_failed: bool = False) -> None:
     """Atomic write of a JSON config file, Fernet-encrypted when CM_MASTER_KEY
@@ -938,7 +944,7 @@ def _write_enc_file(path: str, data, mode: int = 0o600,
     fd, tmp = tempfile.mkstemp(dir=dir_, prefix=".enc_cfg_")
     try:
         # Apply the desired mode before writing any content.
-        os.fchmod(fd, mode)
+        _fchmod(fd, mode)
         with os.fdopen(fd, "wb") as f:
             f.write(content)
             f.flush()
@@ -2266,6 +2272,11 @@ def webauthn_login_complete(req: dict, request: Request):
 # for the cheapest-first cascade. Costs are USD/1M tokens (spend estimates).
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 
+# Provider auth type: api_key (default, metered per token) | subscription
+# (Claude Pro/Max — flat-rate plan, no per-token billing). A subscription
+# provider is callable as long as it has a non-empty key (session token);
+# costs are reported as $0 because the user already pays a flat monthly rate.
+
 DEFAULT_PROVIDERS = {
     "vertex-gemini": {"label": "Vertex Gemini (GCP credits)", "kind": "vertex",
                       "base_url": "", "key": "", "project": VERTEX_PROJECT,
@@ -2289,7 +2300,7 @@ DEFAULT_PROVIDERS = {
                    "in": 0.0, "out": 0.0, "auto": True,
                    "context_window": 128000},
     "anthropic": {"label": "Anthropic Claude", "kind": "anthropic", "base_url": "",
-                  "key": "", "model": "claude-sonnet-4-6",
+                  "key": "", "model": "claude-sonnet-4-6", "auth_type": "api_key",
                   "models": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"],
                   "in": 3.0, "out": 15.0, "auto": False,
                   "context_window": 200000},
@@ -2861,6 +2872,9 @@ def _resolve(prov, pid=None, username=None):
     if entry:
         in_cost = entry.get("in", in_cost)
         out_cost = entry.get("out", out_cost)
+    # Subscription providers are flat-rate — zero per-token cost
+    if prov.get("auth_type") == "subscription":
+        in_cost, out_cost = 0.0, 0.0
     return {"pid": pid, "name": prov.get("label", "?"), "kind": prov.get("kind", ""),
             "base_url": prov.get("base_url", ""), "model": model,
             "api_key": prov.get("key", ""),
@@ -2874,11 +2888,17 @@ def _resolve(prov, pid=None, username=None):
 def _callable_provider(p, username=None):
     """The chat layer can actually call this entry: has a key, and openai-kind
     needs a base_url — blank would hit `requests.post("/chat/completions")`
-    (Invalid URL) and burn the full transient-retry backoff before escalation."""
+    (Invalid URL) and burn the full transient-retry backoff before escalation.
+
+    For subscription-based providers (auth_type == "subscription"), having a
+    session token (stored in `key`) is enough — no separate API key needed.
+    The Anthropic SDK accepts a session cookie string as api_key for Pro/Max."""
     if p.get("kind") == "vertex":
         return _user_can_use_vertex(username)
     if not p.get("key"):
         return False
+    if p.get("auth_type") == "subscription" and p.get("kind") == "anthropic":
+        return True
     return p.get("kind") != "openai" or bool(str(p.get("base_url") or "").strip())
 
 
@@ -2958,6 +2978,7 @@ class ProviderUpsert(BaseModel):
     model: str = ""
     models: list[str] = []
     key: str = ""                  # empty = keep existing key
+    auth_type: str = "api_key"     # api_key | subscription (Claude Pro/Max)
     input_cost_per_m: float = 0.0
     output_cost_per_m: float = 0.0
     auto: bool = True
@@ -2986,6 +3007,7 @@ def models_get(_: str = Depends(verify_owner)):
                          else bool(p.get("key"))),
              "key_hint": ("…" + p["key"][-4:]) if p.get("key") else (
                  "GCP ADC" if p.get("kind") == "vertex" and _vertex_credentials_ready() else ""),
+             "auth_type": p.get("auth_type", "api_key"),
              "in": p.get("in", 0), "out": p.get("out", 0), "auto": p.get("auto", False),
              "catalog": _catalog_for_api(p),
              "catalog_refreshed_at": p.get("catalog_refreshed_at"),
@@ -3000,11 +3022,18 @@ def models_get(_: str = Depends(verify_owner)):
 def models_upsert(req: ProviderUpsert, _: str = Depends(verify_owner)):
     if req.kind not in ("openai", "anthropic", "vertex"):
         raise HTTPException(400, "kind must be openai, anthropic, or vertex")
+    if req.auth_type not in ("api_key", "subscription"):
+        raise HTTPException(400, "auth_type must be api_key or subscription")
+    if req.auth_type == "subscription" and req.kind != "anthropic":
+        raise HTTPException(400, "subscription auth is only supported for Anthropic Claude (Pro/Max)")
     if req.kind == "openai" and not req.base_url.strip():
         raise HTTPException(400, "base_url is required for OpenAI-compatible providers "
                                  "(e.g. https://openrouter.ai/api/v1)")
     in_cost = _validate_cost(req.input_cost_per_m, "input_cost_per_m")
     out_cost = _validate_cost(req.output_cost_per_m, "output_cost_per_m")
+    # Subscription providers are flat-rate — per-token costs are always $0
+    if req.auth_type == "subscription":
+        in_cost, out_cost = 0.0, 0.0
     cfg = load_models()
     prov = cfg["providers"].get(req.id, {})
     prov.update({
@@ -3013,11 +3042,13 @@ def models_upsert(req: ProviderUpsert, _: str = Depends(verify_owner)):
         "models": req.models or prov.get("models", []),
         "in": in_cost, "out": out_cost, "auto": req.auto,
         "notes": req.notes or prov.get("notes", ""),
+        "auth_type": req.auth_type,
     })
-    if req.key:                    # blank key = keep existing
+    if req.key:                    # blank key = keep existing key
         prov["key"] = req.key
         prov.pop("catalog_refreshed_at", None)  # key changed → age indicator resets
     prov.setdefault("key", "")
+    prov.setdefault("auth_type", "api_key")
     if req.model and req.model not in prov["models"]:
         prov["models"].append(req.model)
     cfg["providers"][req.id] = prov
@@ -6825,7 +6856,6 @@ def run_subagent(session, agent_name, task):
         return f"ERROR: no such agent '{agent_name}'. Available: {', '.join(CORPS)}"
     if session["agents_spawned"] >= MAX_SUBAGENTS:
         return f"ERROR: subagent cap ({MAX_SUBAGENTS}) reached for this session"
-    session["agents_spawned"] += 1
     cfg = load_models()
     tier = corps_tier(agent_def)
     _vuser = session.get("username")
@@ -6833,6 +6863,9 @@ def run_subagent(session, agent_name, task):
                 or main_provider(cfg, username=_vuser))
     if not provider:
         return "ERROR: no enabled model provider"
+    # Only consume a subagent slot when a provider is actually available —
+    # a failed spawn (no model configured) must not burn the cap.
+    session["agents_spawned"] += 1
     tool_names = corps_tools(agent_def)
     if session.get("mode") == "plan":
         tool_names = _plan_filter_subagent_tools(tool_names)
