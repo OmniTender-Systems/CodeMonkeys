@@ -1,7 +1,7 @@
 # Forge UI — Maintainer Hygiene Checklist
 
 **Lane:** `forge-streaming` · **Scope:** `static/forge/*` and forge-related docs.  
-**Read first:** `docs/STATE.md`, `docs/README.md`, `WAVES.md`, `OFFICE_HOURS.md`.
+**Read first:** [STATE.md](../STATE.md), [README.md](../README.md), [WAVES.md](../../WAVES.md), [OFFICE_HOURS.md](../../OFFICE_HOURS.md).
 
 Use this before editing the Forge console, landing a UI wave, or reviewing an
 automation PR that touches streaming or frontend assets.
@@ -88,7 +88,7 @@ DATA_DIR=./data ./.venv/bin/pytest tests/test_streaming.py -q
 DATA_DIR=./data ./.venv/bin/pytest tests/test_vendored_tailwind.py -q   # when present
 ```
 
-**UI spot-check:** Forge at `/` (or `/forge` per `OFFICE_HOURS.md`) — login, composer,
+**UI spot-check:** Forge at `/` (or `/forge` per [OFFICE_HOURS.md](../../OFFICE_HOURS.md)) — login, composer,
 streaming text deltas when `STREAM_ENABLED=1`, mobile drawer ≤767px if touched.
 
 **Import smoke:** `DATA_DIR=./data python -c "import server"` (CI runs this before pytest).
@@ -106,7 +106,7 @@ streaming text deltas when `STREAM_ENABLED=1`, mobile drawer ≤767px if touched
 
 ## 6. N-backlog / automation queue status
 
-**As of 2026-07-13:** Safe automation backlog is **exhausted**. `WAVES.md` Active queue
+**As of 2026-07-13:** Safe automation backlog is **exhausted**. [WAVES.md](../../WAVES.md) Active queue
 is empty — **do not start blocked automation waves.**
 
 | Category | Status | Next action |
@@ -117,10 +117,10 @@ is empty — **do not start blocked automation waves.**
 | OAuth app registration, webhook secrets | **owner-gated** | Owner registers apps + sets Fly secrets |
 | Terminal activation (`TERMINAL_ENABLED` + `TERMINAL_EXEC_ENABLED`) | **owner-gated** | Both default OFF → 404 |
 | `fly deploy` / prod config | **owner-gated** | Not automation |
-| `SECURITY.md` substantive edits | **owner-gated** | Manual merge |
+| [SECURITY.md](../../SECURITY.md) substantive edits | **owner-gated** | Manual merge |
 | S6 Layers 2–4 (workspace jail, per-user secrets, shell sandbox) | **owner-gated** | Owner decision |
 
 **Executor rule:** If Active queue is `_(none)_`, document status (this section or
-`WAVES.md`) and stop — do not fabricate waves or merge owner-gated work.
+[WAVES.md](../../WAVES.md)) and stop — do not fabricate waves or merge owner-gated work.
 
-See `WAVES.md` § Blocked / owner-gated for the canonical list.
+See [WAVES.md](../../WAVES.md) § Blocked / owner-gated for the canonical list.
