@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+import sys, os
+# PyInstaller console=False guard: uvicorn's logger touches sys.stdout.isatty()
+# which crashes if sys.stdout is None (windowless Windows .exe). Reopen /dev/null.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+
 """CodeMonkeys — self-hosted, multi-provider AI coding console.
 
 Single-file FastAPI backend:
