@@ -1,4 +1,8 @@
-/* Cursor-like workbench: toggle fleet store panel + embedded terminal + layout persist */
+/* Cursor-like workbench: injects a terminal toggle + fleet store panel into the
+   main column of index.html, persists open/closed state in localStorage.
+   Cross-module: exposes window.Workbench, delegates to FleetStore.init() and
+   EmbeddedTerminal.init(). */
+
 "use strict";
 
 const WB_MOBILE = () => window.matchMedia("(max-width: 767px)").matches;

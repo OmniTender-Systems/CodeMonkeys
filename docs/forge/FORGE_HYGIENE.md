@@ -8,6 +8,77 @@ automation PR that touches streaming or frontend assets.
 
 ---
 
+## 0. Architecture overview (`static/forge/`)
+
+Vanilla JS + vendored Tailwind (`tailwind.css` built from `tailwind.input.css` via
+`npx tailwindcss`). No bundler, no runtime CDN. CSP `script-src 'self'`. Each
+route is a standalone `.html` file sharing the `static/forge/` asset pool.
+
+| Route | Entry HTML | Key JS | Role |
+|-------|-----------|--------|------|
+| `/` | `index.html` | `app.js`, `index-shell.js`, `workbench.js` | Main console / chat shell |
+| `/swarm` | `swarm.html` | `swarm.js` | Full-page canvas swarm visualizer |
+| `/colony` | `swarm_viz.html` | `swarm-viz.js` | Colony visualizer (ring + tree modes, ES module) |
+| `/terminal` | `terminal.js` | `terminal.js` | Claude Code-style REPL (gated OFF) |
+| `/audit` | `audit.html` | `audit.js` | Tamper-evident audit log viewer (owner-only) |
+
+### JS load order (per page)
+
+- `index.html` → `agents-hub.js` → `omni-search.js` → `fleet-store.js` →
+  `workbench.js` → `cursor-desk.js` → `gremlins.js` → `push.js` →
+  `three-card-triage.js` → `egress-consent.js` → `app.js` → `field-report.js` →
+  `feedback.js` → `pwa.js` → `index-shell.js`
+- `swarm.html` → `swarm.js`
+- `terminal.html` → `egress-consent.js` → `terminal.js` → `feedback.js`
+- `audit.html` → `audit.js`
+
+### Cross-module contracts
+
+- `window.api` — exposed by `app.js`; wraps fetch with JSON + Bearer auth + M-4
+  egress consent gate. Other modules (`agents-hub.js`, `workbench.js`) call it
+  instead of re-implementing auth.
+- `window.EgressConsent` — exposed by `egress-consent.js`. `api()` and
+  `terminal.api()` both call `EgressConsent.ensure()` before model calls.
+- `window.AgentsHub` — Cursor-style session + automation modal (Dynamically
+  injected into the DOM by `_ensureModal()`).
+- `window.Workbench` — Injects toolbar, fleet panel, embedded terminal into
+  `index.html`'s main column.
+- `window.__swarmState` — Global written by `swarm_viz.html`; polled at 500 ms
+  by `swarm-viz.js`.
+
+### Accessibility / meta
+
+All five UI pages (`index.html`, `swarm.html`, `terminal.html`, `swarm_viz.html`,
+`audit.html`) now carry `<meta name="description">`. `<title>` is set per page.
+`terminal.html` input has `aria-label`. `audit.html` table headers are `<th scope>`.
+`index.html` uses `role="tablist"` on the dynamic tab bar. Steady Ground crisis
+modal is present on every page (offline-safe, no JS bundle dependency).
+
+### Documentation quality
+
+| File | Top-level docblock | Inline / function docs | Verdict |
+|------|-------------------|------------------------|---------|
+| `app.js` | 1 line | Inline comments on M-4, N5 streaming, proxy shim | adequate — dense file; consider JSDoc on public funcs |
+| `swarm.js` | 2 lines | none | minimal |
+| `terminal.js` | 3-line block | Inline on each event type | good |
+| `swarm-viz.js` | Full module docblock + GDD refs | JSDoc on every exported function | best in dir |
+| `audit.js` | 2-line block + S-3 ref | Inline on hash-chain verify | good |
+| `agents-hub.js` | 1 line | none on methods | minimal — large file |
+| `workbench.js` | 1 line | none on methods | minimal |
+| `index-shell.js` | TBD | TBD | verify |
+
+No `TODO` / `FIXME` / `HACK` markers found in `static/forge/`.
+
+### Dead-code / shim notes
+
+- `index.html` lines ~1154–1191: ~30 hidden proxy elements (`display:none`,
+  `aria-hidden="true"`) used by `app.js` to avoid null-ref errors after the
+  Settings sidebar was migrated into `modal-settings`. Documented inline. Not
+  dead — kept intentionally. Do not remove without auditing `app.js`
+  `getElementById` call sites.
+
+---
+
 ## 1. Path map (`static/forge/`)
 
 | Path | Role |

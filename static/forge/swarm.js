@@ -1,5 +1,11 @@
-/* CodeMonkeys swarm visualizer — extracted from swarm.html's inline <script>
-   so the CSP can be script-src 'self' (Tailwind phase 2). Logic unchanged. */
+/* CodeMonkeys swarm view — full-page canvas visualizer for the live agent pool.
+   Polls GET /api/swarm/state every 4 s, renders agent nodes in a ring around a
+   central orchestrator with animated activity packets. Vanilla JS, no deps.
+
+   Accessibility: this page is a <canvas> without text alternatives by design
+   (glanceable ambient view). For an accessible equivalent, use /colony which
+   exposes state via DOM elements. */
+
 "use strict";
 const token = localStorage.getItem("cm_token") || "";
 const cv = document.getElementById("c"), hud = document.getElementById("hud");

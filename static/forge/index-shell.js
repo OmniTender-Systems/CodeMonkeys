@@ -1,5 +1,10 @@
 /* CodeMonkeys forge shell — extracted from index.html inline <script> blocks
-   so CSP can use script-src 'self' (Tailwind phase 2). Logic unchanged. */
+   so CSP can use script-src 'self' (Tailwind phase 2). Logic unchanged.
+
+   Wires up the settings-modal tab bar, mirrors the session list into the
+   dynamic tab bar via MutationObserver, and syncs proxy element mutations
+   into the Settings modal account tab. */
+
 "use strict";
 
 /* ── Settings modal: tab-bar click wiring ──────────────────────────── */

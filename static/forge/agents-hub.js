@@ -1,4 +1,7 @@
-/* Agents Hub — Cursor-style Agents Window + Automations (sessions, fleet, personas) */
+/* Agents Hub — Cursor-style Agents Window + Automations (sessions, fleet, personas).
+   Injected into the DOM on demand by AgentsHub._ensureModal(); not a React tree.
+   Cross-module: calls window.api (set by app.js), exposes window.AgentsHub. */
+
 "use strict";
 
 const AgentsHub = {
