@@ -600,19 +600,6 @@ def readyz():
         "status": overall,
         "uptime_s": int(time.time()) - _BOOT_TIME,
         "sessions": len(SESSIONS),
-        # disk-space check: a real, verifiable write+delete under DATA_DIR,
-        # reported as a best-effort signal (not a status driver) so the probe
-        # stays honest about storage without failing the run for it.
-        import tempfile as _tf
-        disk_space_ok = False
-        try:
-            fd, tmp = _tf.mkstemp(dir=DATA_DIR, prefix=".disk_space_ok_")
-            os.close(fd)
-            os.unlink(tmp)
-            disk_space_ok = True
-        except Exception:
-            disk_space_ok = False
-
         "checks": {
             "data_writable": data_writable,
             "crypto_ok": crypto_ok,
