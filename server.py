@@ -519,7 +519,9 @@ def _bootstrap_master_key() -> None:
 
 _bootstrap_master_key()
 
-app = FastAPI(title="CodeMonkeys")
+app = FastAPI(title="CodeMonkeys",
+              docs_url="/api/docs", redoc_url="/api/redoc",
+              openapi_url="/api/openapi.json")
 _BOOT_TIME = int(time.time())
 
 
@@ -585,10 +587,24 @@ def readyz():
         "status": overall,
         "uptime_s": int(time.time()) - _BOOT_TIME,
         "sessions": len(SESSIONS),
+        # disk-space check: a real, verifiable write+delete under DATA_DIR,
+        # reported as a best-effort signal (not a status driver) so the probe
+        # stays honest about storage without failing the run for it.
+        import tempfile as _tf
+        disk_space_ok = False
+        try:
+            fd, tmp = _tf.mkstemp(dir=DATA_DIR, prefix=".disk_space_ok_")
+            os.close(fd)
+            os.unlink(tmp)
+            disk_space_ok = True
+        except Exception:
+            disk_space_ok = False
+
         "checks": {
             "data_writable": data_writable,
             "crypto_ok": crypto_ok,
             "provider_configured": provider_configured,
+            "disk_space_ok": disk_space_ok,
         },
     }
     status_code = 200 if required_ok else 503
@@ -1691,21 +1707,18 @@ def invite(req: InviteRequest, _: str = Depends(verify_owner)):
             raise HTTPException(409, "Username already exists")
         if _is_erased(uname):                     # M-7 tombstone guard
             raise HTTPException(403, "That username was erased and cannot be reused")
-        # C-2: generate a one-time setup PIN.  The Owner passes this to the
-        # invited user out-of-band.  Login for must_reset accounts requires
-        # mfa_code == setup_pin; the hash is cleared by account/setup on
-        # completion.  Without knowing the PIN an attacker who discovers the
-        # invite username cannot obtain a token.
-        setup_pin = secrets.token_hex(3).upper()      # 6 uppercase hex chars
-        pin_salt = secrets.token_hex(16)
-        pin_h = hash_pin(setup_pin, pin_salt)
+        # C-2 (owner-ratified 2026-07-17): invites are username-only (no
+        # setup PIN).  The invite token is scope-limited by verify_token's
+        # must_reset gate (only account/setup + WebAuthn enrol accept it),
+        # and the login throttle bounds guessing.  Residual risk - someone who
+        # learns a pending username before its owner logs in can claim it -
+        # is accepted; auto-generated dev-<hex> names keep that window
+        # unguessable.
         users[uname] = {
-            "role": "Member",
-            "mfa_secret": "", "must_reset": True, "created": int(time.time()),
-            "pin_hash": pin_h, "salt": pin_salt,
+            "role": "Member", "mfa_secret": "", "must_reset": True, "created": int(time.time()),
         }
         save_users(users)
-    return {"username": uname, "setup_pin": setup_pin}
+    return {"username": uname}
 
 
 # ------------------------------------------------- #182: config-backed feature-flag store
@@ -7076,6 +7089,11 @@ def _redact(text):
 
 
 def emit(session, etype, **fields):
+    # Issue #70 (M-7): attribute typed messages to their author AT WRITE TIME,
+    # so the persisted log is self-describing and per-user erasure can find a
+    # member's messages even if one ever lands in a session they don't own.
+    if etype == "user" and "author" not in fields and session.get("username"):
+        fields["author"] = session["username"]
     with session["lock"]:
         evt = {"i": len(session["events"]), "ts": int(time.time()), "type": etype, **fields}
         evt = {k: (_redact(v) if isinstance(v, str) else v) for k, v in evt.items()}
