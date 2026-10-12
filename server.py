@@ -2205,15 +2205,30 @@ def me_vertex_clear(username: str = Depends(verify_user)):
 # HARD-DELETES the subject's record AND every other store keyed to that account,
 # writes a tombstone that guards every reactivation path, and emits a receipt.
 #
-# CM persistence is single-Owner-plus-Members with a SHARED workspace: sessions
-# (data/sessions/<sid>), uploads (workspace/uploads/<sid>/), the blackboard and
-# the KB are workspace-global and NOT attributed to a username — deleting them on
-# one member's erasure would destroy other accounts' (incl. the Owner's) data, so
-# they are out of per-user cascade scope by design. The stores actually keyed to a
-# *username* are: the users.json record (which carries pin_hash/salt/mfa_secret/
-# webauthn credentials), the per-username login-throttle counter, and the
-# transient in-memory WebAuthn registration challenge. The cascade clears each.
-# (See PR / report for the full enumeration + the architectural note.)
+# Issue #70 (M-7 follow-up — message content): since S6 Layer 1/2 landed, the
+# content stores are per-user too, so the cascade also covers them:
+#   - sessions are SINGLE-OWNER (session["username"]; only the owner can type
+#     into one — _session_writable), so the member's sessions are deleted whole
+#     (events JSONL + history + index entry) without touching anyone else's;
+#   - typed "user" events are additionally tagged with their author at write
+#     time (emit()), so any of the member's messages that ever land in a session
+#     they do NOT own are found and content-scrubbed individually, leaving the
+#     rest of that shared log intact;
+#   - uploads, blackboards, per-user KB and cloned repos live under the member's
+#     isolated WORKSPACE_DIR/user_<uname>/ subtree, which is deleted whole.
+# Residual (disclosed in GOVERNANCE.md): records written BEFORE attribution
+# existed — legacy username=None sessions and any pre-#70 writes on the
+# workspace-root blackboard/KB — carry no author and cannot be selectively
+# attributed to an erased member; they stay, by design, because deleting those
+# shared records would destroy other accounts' (incl. the Owner's) data.
+# Feedback reports (data/feedback.jsonl) are anonymous by design (no username
+# recorded) and therefore not attributable.
+#
+# The stores actually keyed to a *username* are: the users.json record (which
+# carries pin_hash/salt/mfa_secret/ webauthn credentials), the per-username
+# login-throttle counter, and the transient in-memory WebAuthn registration
+# challenge. The cascade clears each. (See PR / report for the full
+# enumeration + the architectural note.)
 
 def _load_erased() -> dict:
     """The tombstone map {username: {erased_at, by}}. Caller need not hold a lock
@@ -2269,7 +2284,156 @@ def _erase_user_data(uname: str, user_snapshot: dict | None = None) -> list:
                 cleared.append("vertex_user_credentials")
     except Exception as e:
         _log.warning("M-7 erasure: vertex_user clear failed for %r: %s", uname, e)
+    # Issue #70 — message content. Sessions are single-owner, so the member's
+    # own sessions go whole; author-tagged strays in OTHER owners' sessions are
+    # content-scrubbed in place; the isolated workspace subtree goes whole.
+    try:
+        if _erase_user_sessions(uname):
+            cleared.append("sessions")
+    except Exception as e:
+        _log.warning("M-7 erasure: sessions clear failed for %r: %s", uname, e)
+    try:
+        if _scrub_user_authored_events(uname):
+            cleared.append("session_events_scrubbed")
+    except Exception as e:
+        _log.warning("M-7 erasure: event scrub failed for %r: %s", uname, e)
+    try:
+        if _erase_user_workspace(uname):
+            cleared.append("workspace")
+    except Exception as e:
+        _log.warning("M-7 erasure: workspace clear failed for %r: %s", uname, e)
     return cleared
+
+
+_M7_ERASED_MARKER = "[erased per M-7]"
+
+
+def _erase_user_sessions(uname: str) -> int:
+    """Hard-delete every session OWNED by *uname* (issue #70). A session is
+    single-owner — only session["username"] can type into it (_session_writable)
+    — so the whole record (in-memory entry, events JSONL, history JSON, index
+    row) is that member's content and can go without touching any other
+    account's data. Legacy username=None sessions are Owner-only and are left
+    alone. Returns the number of sessions deleted."""
+    if not uname:
+        return 0
+    doomed = []
+    with _SESSIONS_LOCK:
+        for sid in [sid for sid, s in SESSIONS.items()
+                    if s.get("username") == uname]:
+            doomed.append(SESSIONS.pop(sid))
+        if doomed:
+            _persist_index()
+    for s in doomed:
+        # Flag first, then stop: emit()/persist_history() check the flag so an
+        # in-flight run of this session can no longer re-materialize the files.
+        s["_m7_erased"] = True
+        try:
+            s["stop_flag"].set()
+        except Exception:
+            pass
+        for path in (_events_path(s["id"]),
+                     os.path.join(SESSIONS_DIR, f"{s['id']}.history.json")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return len(doomed)
+
+
+def _m7_scrub_event(evt: dict) -> None:
+    """Blank every content-bearing string field of an author-tagged event,
+    keeping the structural skeleton (i/ts/type) so indices, ordering and the
+    surrounding shared log stay intact."""
+    for k, v in list(evt.items()):
+        if k in ("i", "ts", "type"):
+            continue
+        if isinstance(v, str):
+            evt[k] = _M7_ERASED_MARKER
+
+
+def _scrub_user_authored_events(uname: str) -> int:
+    """Selectively erase *uname*'s author-tagged events from sessions they do
+    NOT own (issue #70). Sessions are single-owner today, so after
+    _erase_user_sessions this normally finds nothing — it is the precise-erasure
+    backstop for any tagged message that ever lands in a shared/legacy log.
+    Only the tagged events are scrubbed; every other member's (and the Owner's)
+    events in the same file are byte-identical afterwards. Returns the number
+    of events scrubbed."""
+    if not uname:
+        return 0
+    scrubbed = 0
+    with _SESSIONS_LOCK:
+        others = {sid: s for sid, s in SESSIONS.items()
+                  if s.get("username") != uname}
+    for sid, s in others.items():
+        # In-memory view (may hold only the restored tail of the log). One
+        # malformed session must not abort the scrub of the rest.
+        try:
+            with s["lock"]:
+                for evt in s["events"]:
+                    if isinstance(evt, dict) and evt.get("author") == uname:
+                        _m7_scrub_event(evt)
+        except Exception as e:
+            _log.warning("M-7 erasure: in-memory scrub failed for %s: %s", sid, e)
+        # Persisted JSONL is the full log — rewrite only if a tagged line exists.
+        path = _events_path(sid)
+        try:
+            with open(path, "r", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        out, hit = [], False
+        for line in lines:
+            try:
+                evt = json.loads(line)
+            except ValueError:
+                out.append(line)
+                continue
+            if isinstance(evt, dict) and evt.get("author") == uname:
+                _m7_scrub_event(evt)
+                hit = True
+                scrubbed += 1
+                out.append(json.dumps(evt) + "\n")
+            else:
+                out.append(line)      # untouched lines stay byte-identical
+        if hit:
+            tmp = path + ".tmp"
+            try:
+                with open(tmp, "w") as f:
+                    f.writelines(out)
+                os.replace(tmp, path)
+            except OSError as e:
+                _log.warning("M-7 erasure: could not rewrite %s: %s", path, e)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    return scrubbed
+
+
+def _erase_user_workspace(uname: str) -> bool:
+    """Delete the member's ISOLATED workspace subtree WORKSPACE_DIR/user_<uname>
+    (their uploads, per-user blackboards/KB/specs, cloned repos — issue #70).
+    Strictly guarded so an erasure can never reach shared data: the target must
+    be a real directory (not a symlink) whose realpath is a DIRECT child of
+    WORKSPACE_DIR named exactly user_<uname>; anything else is refused. The
+    workspace ROOT (other members' subtrees, legacy shared files) is never
+    touched. Returns True only if the subtree was removed."""
+    if not uname:
+        return False
+    target = os.path.join(WORKSPACE_DIR, f"user_{uname}")
+    if not os.path.isdir(target):
+        return False
+    root = os.path.realpath(WORKSPACE_DIR)
+    real = os.path.realpath(target)
+    if (os.path.islink(target) or os.path.dirname(real) != root
+            or os.path.basename(real) != f"user_{uname}"):
+        _log.warning("M-7 erasure: refused workspace delete for %r "
+                     "(path did not resolve to a direct user_ subdir)", uname)
+        return False
+    shutil.rmtree(target, ignore_errors=True)
+    return not os.path.isdir(target)
 
 
 def _write_tombstone(uname: str, by: str) -> int:
@@ -6033,7 +6197,7 @@ def t_glob(args):
     pat = args["pattern"]
     out, root = [], os.path.realpath(WORKSPACE_DIR)
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__")]
+        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__", ".venv", ".pytest_cache")]
         for fn in filenames:
             rel = os.path.relpath(os.path.join(dirpath, fn), root)
             if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(fn, pat):
@@ -6048,6 +6212,7 @@ def t_grep(args):
     try:
         r = subprocess.run(
             ["grep", "-rnI", "--exclude-dir=.git", "--exclude-dir=node_modules",
+             "--exclude-dir=.venv", "--exclude-dir=.pytest_cache", "--exclude-dir=__pycache__",
              "-m", "5", "-e", args["pattern"], target],
             capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
@@ -6471,11 +6636,14 @@ def _bb_slug(raw: str) -> str:
 
 def _jail_blackboard(slug: str, username: Optional[str] = None) -> str:
     """Resolve .codemonkeys/blackboard-<slug>.md, confined strictly to
-    <WORKSPACE>/.codemonkeys/ (no subdir, no traversal)."""
+    <WORKSPACE>/.codemonkeys/ (no subdir, no traversal). The per-user workspace
+    dir (and its .codemonkeys root) is created here so a fresh user workspace
+    exists at write time and below."""
     base_dir = WORKSPACE_DIR
     if username:
         base_dir = os.path.join(WORKSPACE_DIR, f"user_{username}")
     root = os.path.realpath(os.path.join(base_dir, ".codemonkeys"))
+    os.makedirs(base_dir, exist_ok=True)
     candidate = os.path.realpath(os.path.join(root, f"blackboard-{slug}.md"))
     if os.path.dirname(candidate) != root:
         raise ValueError(f"Path escapes .codemonkeys dir: {slug}")
@@ -6505,12 +6673,12 @@ def _bb_render(slug: str, sections: dict) -> str:
     return "\n".join(out).strip() + "\n"
 
 
-def t_blackboard_read(args):
+def t_blackboard_read(args, username=None):
     slug = _bb_slug(args.get("slug", ""))
     if not slug:
         return "ERROR: slug is empty after sanitization"
     try:
-        full = _jail_blackboard(slug)
+        full = _jail_blackboard(slug, username)
     except ValueError as e:
         return f"ERROR: {e}"
     if not os.path.exists(full):
@@ -6519,8 +6687,9 @@ def t_blackboard_read(args):
         return f.read(_BB_MAX + 1)[:_BB_MAX]
 
 
-def t_blackboard_write(args):
+def t_blackboard_write(args, username=None):
     slug = _bb_slug(args.get("slug", ""))
+    section = str(args.get("section", "")).upper()
     section = str(args.get("section", "")).upper()
     content = (args.get("content", "") or "").strip()
     mode = args.get("mode", "append")
@@ -6531,7 +6700,7 @@ def t_blackboard_write(args):
     if mode not in ("append", "replace"):
         return "ERROR: mode must be 'append' or 'replace'"
     try:
-        full = _jail_blackboard(slug)
+        full = _jail_blackboard(slug, username)
     except ValueError as e:
         return f"ERROR: {e}"
     # Serialize the whole read-modify-write: concurrent sessions/subagents
@@ -6855,6 +7024,7 @@ def _persist_index():
     idx = {sid: {"title": s.get("title", "Untitled"), "repo": s.get("repo"), "created": s.get("created", 0),
                  "budget_usd": s.get("budget_usd"),
                  "status": s.get("status", "idle"), "mode": s.get("mode", "default"),
+                 "tags": s.get("tags", []),
                  "username": s.get("username")}
            for sid, s in SESSIONS.items()}
     os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -6886,7 +7056,13 @@ def session_budget(session) -> float:
     return b if b else SESSION_BUDGET_USD
 
 
-def new_session(title="", repo="", budget_usd=None, username=None):
+def _normalize_session_tags(tags):
+    if not tags:
+        return []
+    return [t.strip()[:30] for t in tags if t.strip()][:10]
+
+
+def new_session(title="", repo="", budget_usd=None, username=None, tags=None):
     sid = uuid.uuid4().hex[:12]
     with _SESSIONS_LOCK:
         SESSIONS[sid] = {
@@ -6898,6 +7074,7 @@ def new_session(title="", repo="", budget_usd=None, username=None):
             "agents_spawned": 0, "stop_flag": threading.Event(),
             "approvals": {}, "lock": threading.Lock(),
             "username": username,
+            "tags": _normalize_session_tags(tags),
         }
         _persist_index()
     return SESSIONS[sid]
@@ -6964,6 +7141,7 @@ def restore_sessions():
             "agents_spawned": 0, "stop_flag": threading.Event(),
             "approvals": {}, "lock": threading.Lock(),
             "username": meta.get("username"),
+            "tags": meta.get("tags", []),
         }
         try:
             with open(_events_path(sid)) as f:
@@ -7098,6 +7276,8 @@ def emit(session, etype, **fields):
         evt = {"i": len(session["events"]), "ts": int(time.time()), "type": etype, **fields}
         evt = {k: (_redact(v) if isinstance(v, str) else v) for k, v in evt.items()}
         session["events"].append(evt)
+    if session.get("_m7_erased"):
+        return evt      # erased mid-run: never re-materialize the deleted log
     try:
         with open(_events_path(session["id"]), "a") as f:
             f.write(json.dumps(evt) + "\n")
@@ -7115,6 +7295,8 @@ def emit(session, etype, **fields):
 
 
 def persist_history(session):
+    if session.get("_m7_erased"):
+        return          # see _erase_user_sessions (issue #70)
     _save_json(os.path.join(SESSIONS_DIR, f"{session['id']}.history.json"),
                session["history"])
 
@@ -7386,7 +7568,7 @@ def make_executor(session, allowed, agent_label=None, depth=0):
                 with open(full, "r", errors="replace") as f:
                     return f.read(_BB_MAX + 1)[:_BB_MAX], True
             if name == "blackboard_write":
-                r = t_blackboard_write(args)
+                r = t_blackboard_write(args, username)
                 return r, not r.startswith("ERROR")
             if name == "run_lint":
                 return t_run_lint(args, session=session), True
@@ -7909,6 +8091,7 @@ class SessionCreate(BaseModel):
     title: str = ""
     repo: str = ""
     budget_usd: float | None = None     # W10: per-session cap; None → global default
+    tags: List[str] | None = None
 
 
 class FileUpload(BaseModel):
@@ -8074,21 +8257,25 @@ def session_create(req: SessionCreate, username: str = Depends(verify_user)):
         if budget is None:
             # Clamp the global default down to the member cap too
             budget = min(SESSION_BUDGET_USD, member_cap) if member_cap > 0 else None
-    s = new_session(req.title, req.repo, budget, username=username)
+    s = new_session(req.title, req.repo, budget, username=username, tags=req.tags)
     return {"id": s["id"], "budget_usd": session_budget(s)}
 
 
 @app.get("/api/sessions")
-def session_list(username: str = Depends(verify_user)):
+def session_list(tag: Optional[str] = None, username: str = Depends(verify_user)):
     is_owner = _is_owner_user(username)
     rows = []
     for s in SESSIONS.values():
         if not _session_visible(s, username):
             continue
+        tags = s.get("tags", [])
+        if tag and tag not in tags:
+            continue
         row = {"id": s["id"], "title": s["title"], "repo": s["repo"],
                "created": s["created"], "status": s["status"],
                "spent_usd": round(s["spent_usd"], 4),
-               "budget_usd": round(session_budget(s), 4)}
+               "budget_usd": round(session_budget(s), 4),
+               "tags": tags}
         if is_owner and s.get("username") and s.get("username") != username:
             row["read_only"] = True
         rows.append(row)
@@ -9261,7 +9448,8 @@ def session_delete(sid: str, username: str = Depends(verify_user)):
 
 
 class SessionRename(BaseModel):
-    title: str
+    title: Optional[str] = None
+    tags: Optional[List[str]] = None
 
 class FeedbackRequest(BaseModel):
     category: Optional[str] = "bug"
@@ -9277,16 +9465,19 @@ class FeedbackStatusRequest(BaseModel):
 
 @app.patch("/api/sessions/{sid}")
 def session_rename(sid: str, req: SessionRename, username: str = Depends(verify_user)):
-    """Update the session title (in-memory + index)."""
+    """Update the session title and/or tags (in-memory + index)."""
     s = _get_session(sid, username, write=True)
-    title = req.title.strip()[:120]
-    if not title:
-        raise HTTPException(400, "Title cannot be empty")
     with s["lock"]:
-        s["title"] = title
-        s["title_auto"] = False
+        if req.title is not None:
+            title = req.title.strip()[:120]
+            if not title:
+                raise HTTPException(400, "Title cannot be empty")
+            s["title"] = title
+            s["title_auto"] = False
+        if req.tags is not None:
+            s["tags"] = _normalize_session_tags(req.tags)
     _persist_index()
-    return {"ok": True, "title": title}
+    return {"ok": True, "title": s["title"], "tags": s.get("tags", [])}
 
 
 # ---- Fleet Deck status feed (~/fleet/contracts/fleetdeck-codemonkeys.md) ------
