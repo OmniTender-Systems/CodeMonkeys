@@ -806,19 +806,7 @@
   </div>
 </div>
 
-<script>
-window.switchModelsTab = function(tabName, btn) {
-  document.querySelectorAll('#mmodal-nav .mmodal-tab').forEach(b => {
-    b.className = 'mmodal-tab px-3 py-1.5 rounded font-medium text-slate-400 hover:text-slate-200 border border-transparent';
-  });
-  if (btn) {
-    btn.className = 'mmodal-tab px-3 py-1.5 rounded font-medium bg-yellow-900/30 text-yellow-300 border border-yellow-700/50';
-  }
-  document.querySelectorAll('.mview-tab').forEach(el => el.classList.add('hidden'));
-  const target = document.getElementById('mview-' + tabName);
-  if (target) target.classList.remove('hidden');
-};
-</script>
+<script src="/static/forge/models-modal.js"></script>
 
 <!-- ============ MCP MODAL ============ -->
 <div id="modal-mcp" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -1142,6 +1130,11 @@ window.switchModelsTab = function(tabName, btn) {
       <button id="stn-btn-send-feedback" class="settings-action-btn mt-1" onclick="window.FeedbackFab?.open?.();document.getElementById('modal-settings').classList.add('hidden');document.getElementById('modal-settings-backdrop').classList.add('hidden');">💬 Send Feedback →</button>
       <button id="stn-btn-gremlins" class="settings-action-btn mt-1" onclick="document.getElementById('modal-gremlins').classList.remove('hidden');document.getElementById('modal-settings').classList.add('hidden');document.getElementById('modal-settings-backdrop').classList.add('hidden');">👹 Open Code Gremlins →</button>
       <button id="stn-btn-steady-ground" class="settings-action-btn mt-1" onclick="document.getElementById('steady-ground-modal').classList.remove('hidden');document.getElementById('modal-settings').classList.add('hidden');document.getElementById('modal-settings-backdrop').classList.add('hidden');">🫂 Steady Ground Resources →</button>
+  <button id="steady-ground-btn" type="button" aria-label="Get crisis help now" style="z-index:99998"
+    onclick="document.getElementById('steady-ground-modal').classList.remove('hidden')"
+    class="fixed bottom-[128px] right-4 bg-slate-900/90 hover:bg-slate-800 border border-rose-700/70 text-rose-200 text-xs font-semibold px-3 py-2 rounded-full shadow-lg backdrop-blur-sm flex items-center gap-1.5 transition">
+    <span aria-hidden="true">🫂</span> Steady Ground
+  </button>
 
       <!-- Deep integration -->
       <div class="settings-section-title mt-5">🖥 Cursor Desk</div>
