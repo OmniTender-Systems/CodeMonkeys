@@ -4,6 +4,7 @@
     python -m cli --server URL       # connect to a specific server
     python -m cli --new "title"      # start a fresh session
     python -m cli --logout           # forget the saved token
+    python -m cli -p "prompt"        # non-interactive: send prompt, print reply, exit
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from rich.prompt import Prompt
 
 from . import config
 from .client import ApiError, Client
+from .dashboard import render_dashboard
 from .repl import Repl
 
 # Owner report (2026-07-20): a fresh `monkey` install with no prior config and
@@ -38,7 +40,7 @@ def _login(console: Console, client: Client) -> None:
     console.print(f"[green]logged in as {data['username']} ({data['role']})[/green]")
 
 
-def _pick_or_create_session(console: Console, client: Client, new_title: str | None) -> str:
+def _pick_or_create_session(console: Console, client: Client, new_title: str | None, username: str = "") -> str:
     if new_title is not None:
         s = client.create_session(title=new_title)
         console.print(f"[green]created session {s['id']}[/green]")
@@ -48,20 +50,55 @@ def _pick_or_create_session(console: Console, client: Client, new_title: str | N
         s = client.create_session(title="")
         console.print(f"[green]created session {s['id']}[/green]")
         return s["id"]
-    console.print("[bold]sessions:[/bold]")
+    render_dashboard(console, sessions, client.base_url, username)
+    console.print("[dim](pick a number to resume, or describe a new task)[/dim]")
     for i, s in enumerate(sessions[:20]):
         console.print(f"  {i}: [{s['status']}] {s['title'] or '(untitled)'} — {s['id']}")
-    console.print(f"  n: new session")
-    choice = Prompt.ask("pick", default="0")
-    if choice.strip().lower() == "n":
+    choice = Prompt.ask("describe a task for a new session", default="")
+    if not choice.strip():
         s = client.create_session(title="")
         console.print(f"[green]created session {s['id']}[/green]")
         return s["id"]
     try:
         return sessions[int(choice)]["id"]
     except (ValueError, IndexError):
-        console.print("[red]invalid choice[/red]")
-        sys.exit(1)
+        # Not a valid index -- treat free text as a new session's opening
+        # title, matching Claude Code's "describe a task for a new session".
+        s = client.create_session(title=choice.strip())
+        console.print(f"[green]created session {s['id']}[/green]")
+        return s["id"]
+
+
+def _run_print_mode(console: Console, client: Client, sid: str, prompt_text: str) -> int:
+    """Non-interactive one-shot: send PROMPT, stream/print the reply, exit.
+    Mirrors `claude -p` — for scripts and pipelines, no REPL, no approval UI
+    (auto-denies any approval so a scripted run never hangs waiting on a
+    human)."""
+    from .repl import Repl
+
+    repl = Repl(client, sid, console)
+    # Route approval prompts to a safe non-interactive default (deny) instead
+    # of blocking on stdin, which would hang a script forever.
+    repl._render_event_orig = repl._render_event
+
+    def _render_event_noninteractive(e: dict) -> None:
+        if e.get("type") == "approval":
+            console.print(f"[yellow]⚠ approval required, auto-denied in --print mode:[/yellow] {e.get('command') or ''}", style="dim")
+            try:
+                client.approve(sid, e["approval_id"], False)
+            except ApiError:
+                pass
+            return
+        repl._render_event_orig(e)
+
+    repl._render_event = _render_event_noninteractive
+    try:
+        client.send_message(sid, prompt_text)
+        repl.wait_for_turn()
+    except ApiError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -69,6 +106,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--server", help="server base URL (default: last used, or " + DEFAULT_SERVER)
     parser.add_argument("--new", metavar="TITLE", nargs="?", const="", default=None, help="start a new session")
     parser.add_argument("--logout", action="store_true", help="forget the saved token and exit")
+    parser.add_argument(
+        "-p", "--print", dest="print_prompt", metavar="PROMPT", default=None,
+        help="non-interactive mode: send PROMPT, print the assistant's reply, exit (for scripts/pipes)",
+    )
     args = parser.parse_args(argv)
 
     console = Console()
@@ -99,10 +140,13 @@ def main(argv: list[str] | None = None) -> int:
         config.save({**cfg, "server": server})
 
     try:
-        sid = _pick_or_create_session(console, client, args.new)
+        sid = _pick_or_create_session(console, client, args.new, username=cfg.get("username", ""))
     except ApiError as exc:
         console.print(f"[red]{exc}[/red]")
         return 1
+
+    if args.print_prompt is not None:
+        return _run_print_mode(console, client, sid, args.print_prompt)
 
     Repl(client, sid, console).run()
     return 0
